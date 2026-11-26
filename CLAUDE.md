@@ -42,9 +42,10 @@ Human contributors follow the same rules; see [CONTRIBUTING.md](CONTRIBUTING.md)
 ## Enforcement
 
 The push and merge rules above are enforced by Claude Code permissions in
-[.claude/settings.json](.claude/settings.json), not only by these instructions:
+[.claude/settings.json](.claude/settings.json), not only by these instructions. Each rule is set for
+both shell tools, `Bash(...)` and `PowerShell(...)`:
 
-| Rule | Setting |
+| Rule | Setting (Bash and PowerShell) |
 |---|---|
 | Merging is always done by the human | `deny`: `gh pr merge`, `gh pr ready` |
 | No force pushes | `deny`: `git push --force`, `git push -f` |
