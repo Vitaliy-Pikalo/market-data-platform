@@ -38,3 +38,20 @@ Human contributors follow the same rules; see [CONTRIBUTING.md](CONTRIBUTING.md)
 - Stop and show the user the diff (`git diff origin/main...HEAD` plus `git log --oneline origin/main..HEAD`) before any `git push`.
   Push only after the user approves.
 - Never merge a PR; the user merges.
+
+## Enforcement
+
+The push and merge rules above are enforced by Claude Code permissions in
+[.claude/settings.json](.claude/settings.json), not only by these instructions:
+
+| Rule | Setting |
+|---|---|
+| Merging is always done by the human | `deny`: `gh pr merge`, `gh pr ready` |
+| No force pushes | `deny`: `git push --force`, `git push -f` |
+| Stop and show the diff before pushing | `ask`: `git push` |
+| The human approves opening a PR | `ask`: `gh pr create` |
+
+- Merging is always done by the human. Do not try to get around a denied command (other tools, the GitHub API, a script).
+- The rules match by command prefix. `git push origin main --force` is not caught by the force-push deny rule,
+  but it still needs approval through the `git push` ask rule. Never force push.
+- Personal overrides go in `.claude/settings.local.json`, which is gitignored. Do not weaken these rules in the shared file.
