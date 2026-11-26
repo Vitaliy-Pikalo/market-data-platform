@@ -6,3 +6,4 @@ bin/
 *.exe
 .idea/
 .vscode/
+.claude/settings.local.json
