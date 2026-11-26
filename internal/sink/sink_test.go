@@ -1,6 +1,8 @@
 package sink
 
 import (
+	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -140,6 +142,122 @@ func TestPartialUntilClose(t *testing.T) {
 			t.Errorf("leftover partial after Close: %s", p)
 		}
 	}
+}
+
+func TestPeriodicFlush(t *testing.T) {
+	tests := []struct {
+		name       string
+		interval   time.Duration
+		writes     []write
+		partial    string // file (relative) to read without Close
+		want       string // content decodable from partial before Close
+		wantClosed string // full content of that file after Close
+	}{
+		{
+			name:       "nothing on disk before interval",
+			interval:   5 * time.Second,
+			writes:     []write{{"2026-11-26T10:00:00Z", "a"}, {"2026-11-26T10:00:04.999Z", "b"}},
+			partial:    "2026-11-26/10.jsonl.zst.partial",
+			want:       "",
+			wantClosed: "a\nb\n",
+		},
+		{
+			name:       "flush when interval reached includes the triggering line",
+			interval:   5 * time.Second,
+			writes:     []write{{"2026-11-26T10:00:00Z", "a"}, {"2026-11-26T10:00:05Z", "b"}},
+			partial:    "2026-11-26/10.jsonl.zst.partial",
+			want:       "a\nb\n",
+			wantClosed: "a\nb\n",
+		},
+		{
+			name:       "lines after the last flush are not yet on disk",
+			interval:   5 * time.Second,
+			writes:     []write{{"2026-11-26T10:00:00Z", "a"}, {"2026-11-26T10:00:05Z", "b"}, {"2026-11-26T10:00:06Z", "c"}},
+			partial:    "2026-11-26/10.jsonl.zst.partial",
+			want:       "a\nb\n",
+			wantClosed: "a\nb\nc\n",
+		},
+		{
+			name:     "interval restarts after each flush",
+			interval: 5 * time.Second,
+			writes: []write{
+				{"2026-11-26T10:00:00Z", "a"}, {"2026-11-26T10:00:05Z", "b"},
+				{"2026-11-26T10:00:09Z", "c"}, {"2026-11-26T10:00:10Z", "d"},
+			},
+			partial:    "2026-11-26/10.jsonl.zst.partial",
+			want:       "a\nb\nc\nd\n",
+			wantClosed: "a\nb\nc\nd\n",
+		},
+		{
+			name:     "interval restarts when a new hourly file opens",
+			interval: 5 * time.Second,
+			writes: []write{
+				{"2026-11-26T10:59:58Z", "a"}, {"2026-11-26T11:00:01Z", "b"},
+				{"2026-11-26T11:00:05Z", "c"}, // 4s after open: no flush yet
+			},
+			partial:    "2026-11-26/11.jsonl.zst.partial",
+			want:       "",
+			wantClosed: "b\nc\n",
+		},
+		{
+			name:       "zero interval disables periodic flush",
+			interval:   0,
+			writes:     []write{{"2026-11-26T10:00:00Z", "a"}, {"2026-11-26T10:30:00Z", "b"}},
+			partial:    "2026-11-26/10.jsonl.zst.partial",
+			want:       "",
+			wantClosed: "a\nb\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			clk := &fakeClock{}
+			w := New(dir, WithClock(clk.now), WithFlushInterval(tt.interval))
+			for _, wr := range tt.writes {
+				clk.t = ts(wr.at)
+				if err := w.Write([]byte(wr.line)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Simulates a crash: read the .partial file while the writer is still open.
+			if got := readPartial(t, filepath.Join(dir, filepath.FromSlash(tt.partial))); got != tt.want {
+				t.Errorf("decoded from %s before Close = %q, want %q", tt.partial, got, tt.want)
+			}
+
+			// After Close everything for that hour is present.
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			final := strings.TrimSuffix(tt.partial, ".partial")
+			if got := readZstd(t, filepath.Join(dir, filepath.FromSlash(final))); got != tt.wantClosed {
+				t.Errorf("%s after Close = %q, want %q", final, got, tt.wantClosed)
+			}
+		})
+	}
+}
+
+// readPartial decodes as much of an unfinished zstd file as possible. A frame
+// that was flushed but never closed ends in io.ErrUnexpectedEOF, which is expected.
+func readPartial(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) == 0 {
+		return ""
+	}
+	dec, err := zstd.NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	out, err := io.ReadAll(dec)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("decode %s: %v", p, err)
+	}
+	return string(out)
 }
 
 func TestExistingFilesAreNotOverwritten(t *testing.T) {

@@ -39,7 +39,8 @@ in zstd-compressed files at `data/<src>/YYYY-MM-DD/HH.jsonl.zst` (UTC), one file
 - `raw` is the original message bytes, embedded as-is (never re-encoded).
 - Files are written as `HH.jsonl.zst.partial` and renamed on clean close (hourly rotation or shutdown).
   A leftover `.partial` file is the output of a crashed writer. It can still be decoded up to the last
-  complete zstd block.
+  flush (the decoder then reports an unexpected EOF, because the frame was never finished).
+- The zstd encoder is flushed from the write path at most every 5 s (`sink.WithFlushInterval`).
 - Existing files are never overwritten: a restart within the same hour writes `HH.1.jsonl.zst`, and so on.
 - Compression uses `github.com/klauspost/compress/zstd` (pure Go, no cgo).
 
@@ -80,8 +81,8 @@ in zstd-compressed files at `data/<src>/YYYY-MM-DD/HH.jsonl.zst` (UTC), one file
 - Data can be inspected with `zstd -dc data/coinbase/2026-11-26/19.jsonl.zst | head | jq .`.
 - Consumers must parse `raw` per exchange and per channel; the recorder does no normalization.
 - `recv_ns` is our wall clock, not the exchange time, and is only as good as the host's clock sync.
-- A crash loses data still in the zstd encoder buffer (up to one block, ~128 KiB uncompressed). If that
-  becomes a problem, add a periodic flush, which makes compression slightly worse.
+- A crash loses at most the data written since the last flush (about 5 s of messages, or more if no
+  message arrived to trigger the flush). Flushing ends a zstd block early, which makes compression slightly worse.
 - The recorder rejects messages that are not valid JSON (logged and dropped), since they cannot be embedded
   as `raw`. If an exchange sends non-JSON frames, this ADR needs revisiting.
 - Revisit if storage volume or scan speed becomes a problem (then consider Parquet as a derived format),

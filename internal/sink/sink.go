@@ -4,6 +4,11 @@
 // open it is named HH.jsonl.zst.partial; it is renamed to its final name only
 // when it is closed cleanly (hour rotation or Close). A leftover .partial file
 // therefore marks a file whose writer crashed.
+//
+// The zstd encoder is flushed from Write at most every flush interval
+// (default 5s), so after a crash a .partial file can be decoded up to the
+// last flush; the decoder then reports io.ErrUnexpectedEOF because the frame
+// was never finished.
 package sink
 
 import (
@@ -18,17 +23,22 @@ import (
 
 const partialSuffix = ".partial"
 
+// DefaultFlushInterval is how often Write flushes the zstd encoder by default.
+const DefaultFlushInterval = 5 * time.Second
+
 // Writer is an hourly-rotating zstd JSONL writer. It is not safe for
 // concurrent use.
 type Writer struct {
-	dir string
-	now func() time.Time
+	dir        string
+	now        func() time.Time
+	flushEvery time.Duration
 
-	hour  time.Time // start of the hour the open file belongs to (UTC)
-	path  string    // final path of the open file
-	file  *os.File
-	enc   *zstd.Encoder
-	bytes int64 // uncompressed bytes written to the open file
+	hour      time.Time // start of the hour the open file belongs to (UTC)
+	path      string    // final path of the open file
+	file      *os.File
+	enc       *zstd.Encoder
+	bytes     int64     // uncompressed bytes written to the open file
+	lastFlush time.Time // when the encoder was last flushed (or the file opened)
 }
 
 // Option configures a Writer.
@@ -39,10 +49,17 @@ func WithClock(now func() time.Time) Option {
 	return func(w *Writer) { w.now = now }
 }
 
+// WithFlushInterval sets how often Write flushes the zstd encoder to the file.
+// d <= 0 disables periodic flushing (data then reaches the file only when an
+// encoder block fills up, or on rotation/Close).
+func WithFlushInterval(d time.Duration) Option {
+	return func(w *Writer) { w.flushEvery = d }
+}
+
 // New returns a Writer that writes under dir. No file is created until the
 // first Write.
 func New(dir string, opts ...Option) *Writer {
-	w := &Writer{dir: dir, now: time.Now}
+	w := &Writer{dir: dir, now: time.Now, flushEvery: DefaultFlushInterval}
 	for _, o := range opts {
 		o(w)
 	}
@@ -50,14 +67,16 @@ func New(dir string, opts ...Option) *Writer {
 }
 
 // Write appends line followed by '\n' to the file for the current UTC hour,
-// rotating first if the hour changed. line must not contain '\n'.
+// rotating first if the hour changed, and flushes the encoder if the flush
+// interval has passed. line must not contain '\n'.
 func (w *Writer) Write(line []byte) error {
-	hour := w.now().UTC().Truncate(time.Hour)
+	now := w.now()
+	hour := now.UTC().Truncate(time.Hour)
 	if w.file == nil || !hour.Equal(w.hour) {
 		if err := w.closeCurrent(); err != nil {
 			return err
 		}
-		if err := w.open(hour); err != nil {
+		if err := w.open(hour, now); err != nil {
 			return err
 		}
 	}
@@ -68,6 +87,12 @@ func (w *Writer) Write(line []byte) error {
 		return fmt.Errorf("sink: write %s: %w", w.path, err)
 	}
 	w.bytes += int64(len(line)) + 1
+	if w.flushEvery > 0 && now.Sub(w.lastFlush) >= w.flushEvery {
+		if err := w.enc.Flush(); err != nil {
+			return fmt.Errorf("sink: flush %s: %w", w.path, err)
+		}
+		w.lastFlush = now
+	}
 	return nil
 }
 
@@ -84,7 +109,7 @@ func (w *Writer) CurrentPath() string {
 	return w.path
 }
 
-func (w *Writer) open(hour time.Time) error {
+func (w *Writer) open(hour, now time.Time) error {
 	dayDir := filepath.Join(w.dir, hour.Format("2006-01-02"))
 	if err := os.MkdirAll(dayDir, 0o755); err != nil {
 		return fmt.Errorf("sink: mkdir: %w", err)
@@ -102,7 +127,7 @@ func (w *Writer) open(hour time.Time) error {
 		f.Close()
 		return fmt.Errorf("sink: zstd: %w", err)
 	}
-	w.hour, w.path, w.file, w.enc, w.bytes = hour, path, f, enc, 0
+	w.hour, w.path, w.file, w.enc, w.bytes, w.lastFlush = hour, path, f, enc, 0, now
 	return nil
 }
 
