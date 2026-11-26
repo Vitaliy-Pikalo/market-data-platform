@@ -2,6 +2,15 @@
 //
 // The first number seen after New or Reset becomes the baseline. After that
 // every message is expected to carry previous+1.
+//
+// Gaps are per connection, not per channel: Coinbase numbers every message on
+// a connection with one sequence_num counter shared by all subscribed
+// channels, and the counter starts over on a new connection. Use one Checker
+// per connection and call Reset on reconnect; a gap across a reconnect is
+// therefore never reported. A missing message's channel cannot be known, so
+// callers attribute a gap to the channel of the message that exposed it (the
+// first one received after the gap). Per-channel gap counts are thus "gaps
+// noticed on this channel", not "messages lost from this channel".
 package seqcheck
 
 // Kind classifies one observation.
