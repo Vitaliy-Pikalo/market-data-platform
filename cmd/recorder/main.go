@@ -99,6 +99,9 @@ func run(log *slog.Logger, products []string, dir, url string, statsEvery time.D
 		Gap: func(channel string, r seqcheck.Result) {
 			st.gap(channel, r)
 		},
+		Dropped: func(raw []byte, _ error) {
+			st.dropped(len(raw))
+		},
 		Reconnect: func(int, time.Duration, error) {
 			st.reconnect()
 		},
@@ -146,6 +149,10 @@ type stats struct {
 	channels   map[string]*channelStats
 	reconnects int
 	compact    int
+	// Non-JSON messages are dropped before their channel is known, so they
+	// are counted globally rather than per channel.
+	droppedMsgs  int64
+	droppedBytes int64
 }
 
 type channelStats struct {
@@ -199,6 +206,13 @@ func (s *stats) reconnect() {
 	s.mu.Unlock()
 }
 
+func (s *stats) dropped(n int) {
+	s.mu.Lock()
+	s.droppedMsgs++
+	s.droppedBytes += int64(n)
+	s.mu.Unlock()
+}
+
 func (s *stats) compacted() {
 	s.mu.Lock()
 	s.compact++
@@ -229,5 +243,6 @@ func (s *stats) log(log *slog.Logger, msg string) {
 		"msgs", total.Msgs, "bytes", total.Bytes, "reconnects", s.reconnects,
 		"gaps", total.Gaps, "missing", total.Missing, "behind", total.Behind,
 		"compacted", s.compact,
+		"dropped", s.droppedMsgs, "dropped_bytes", s.droppedBytes,
 		slog.Group("channels", attrs...))
 }

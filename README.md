@@ -59,7 +59,7 @@ connection. A connection with no message for 30 s is treated as dead. Every reco
 **Gap detection:** `sequence_num` is tracked per connection (reset on reconnect); skipped numbers are logged
 with expected, got and missing count.
 
-**Logs:** JSON (`log/slog`) on stderr, including a cumulative `stats` line every 60 s with msgs, bytes,
+**Logs:** JSON (`log/slog`) on stderr, including a cumulative `stats` line every 60 s with msgs, bytes, dropped non-JSON messages,
 reconnects and gaps per channel.
 
 ## Repo layout

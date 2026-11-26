@@ -64,6 +64,9 @@ type Handler struct {
 	Message func(Message) error
 	// Gap is called when sequence_num skips or goes backwards.
 	Gap func(channel string, r seqcheck.Result)
+	// Dropped is called for a message that is not valid JSON. Such messages
+	// cannot be stored as raw JSON and are not passed to Message.
+	Dropped func(raw []byte, err error)
 	// Reconnect is called before each reconnect wait.
 	Reconnect func(attempt int, wait time.Duration, cause error)
 }
@@ -183,6 +186,9 @@ func (c *Client) session(ctx context.Context, h Handler) (time.Duration, error) 
 		if err := json.Unmarshal(data, &hdr); err != nil {
 			// Not JSON: cannot be stored as raw JSON. Log and skip.
 			c.log.Error("invalid json message dropped", "err", err.Error(), "len", len(data))
+			if h.Dropped != nil {
+				h.Dropped(data, err)
+			}
 			continue
 		}
 		if hdr.Type == "error" {
