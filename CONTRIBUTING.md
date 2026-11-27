@@ -19,7 +19,7 @@ Claude Code sessions follow the same rules via [CLAUDE.md](CLAUDE.md).
    - No filler commits: formatting- or whitespace-only commits are fine only when they are a real change.
 4. **Open a pull request** with the template. Fill in every section, link the issue with `Closes #N`,
    and back every claim with the command you ran and its output.
-5. **Review and merge.** The maintainer merges.
+5. **Review and merge.** CI must be green to merge. The maintainer merges.
 
 ## Results and benchmarks
 
