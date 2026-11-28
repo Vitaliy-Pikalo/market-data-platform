@@ -1,6 +1,6 @@
 module github.com/Vitaliy-Pikalo/market-data-platform
 
-go 1.25
+go 1.27
 
 require (
 	github.com/coder/websocket v1.8.15
