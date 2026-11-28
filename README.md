@@ -1,5 +1,7 @@
 # market-data-platform
 
+[![CI](https://github.com/Vitaliy-Pikalo/market-data-platform/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Vitaliy-Pikalo/market-data-platform/actions/workflows/ci.yml)
+
 Real-time crypto market-data platform on Kubernetes. Public exchange WebSocket feeds (Coinbase, Kraken, Binance.US) are ingested by Go services, written to Kafka (Strimzi), stored in ClickHouse (Altinity operator + Keeper), and served as statistics in Grafana. The focus is operational: replication, failover, backups, restore drills, chaos testing and measured end-to-end latency.
 
 ## Architecture
