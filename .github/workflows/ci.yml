@@ -13,8 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Staticcheck 2026.1. Newer releases (2026.2.x) need Go >= 1.26; go.mod is on 1.25.
-  STATICCHECK_VERSION: v0.7.0
+  # Staticcheck 2026.2.2 (latest). 2026.2 added Go 1.27 support; 2026.2.2 supports the
+  # export data format of Go 1.27.2+. https://github.com/dominikh/go-tools/releases/tag/2026.2.2
+  STATICCHECK_VERSION: v0.8.2
 
 jobs:
   test:
