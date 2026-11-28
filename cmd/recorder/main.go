@@ -1,10 +1,11 @@
-// Command recorder records raw Coinbase Advanced Trade market data to disk.
+// Command recorder records raw exchange market data to disk, one exchange
+// per process (see docs/adr/0003-one-recorder-process-per-exchange.md).
 //
 // Each WebSocket message becomes one line
 //
-//	{"recv_ns":<unix nanos>,"src":"coinbase","raw":<original json>}
+//	{"recv_ns":<unix nanos>,"src":"<exchange>","raw":<original json>}
 //
-// in <out>/coinbase/YYYY-MM-DD/HH.jsonl.zst (UTC, rotated hourly).
+// in <out>/<exchange>/YYYY-MM-DD/HH.jsonl.zst (UTC, rotated hourly).
 // Ctrl+C flushes and closes the current file.
 package main
 
@@ -26,38 +27,117 @@ import (
 	"time"
 
 	"github.com/Vitaliy-Pikalo/market-data-platform/internal/feed/coinbase"
+	"github.com/Vitaliy-Pikalo/market-data-platform/internal/feed/kraken"
 	"github.com/Vitaliy-Pikalo/market-data-platform/internal/seqcheck"
 	"github.com/Vitaliy-Pikalo/market-data-platform/internal/sink"
 )
 
-const src = "coinbase"
+// exchange describes one supported feed.
+type exchange struct {
+	name           string
+	defaultURL     string
+	defaultSymbols []string
+	// run streams until ctx is done or a fatal error, reporting through h.
+	run func(ctx context.Context, log *slog.Logger, url string, symbols []string, h hooks) error
+}
+
+// hooks are the feed-independent callbacks the recorder wires into a feed.
+type hooks struct {
+	message   func(recvNs int64, channel string, raw []byte) error
+	gap       func(channel string, r seqcheck.Result)
+	dropped   func(raw []byte, err error)
+	reconnect func(attempt int, wait time.Duration, cause error)
+}
+
+var exchanges = map[string]exchange{
+	"coinbase": {
+		name:           "coinbase",
+		defaultURL:     coinbase.DefaultURL,
+		defaultSymbols: []string{"BTC-USD", "ETH-USD", "SOL-USD"},
+		run: func(ctx context.Context, log *slog.Logger, url string, symbols []string, h hooks) error {
+			return coinbase.New(coinbase.Config{URL: url, Products: symbols, Logger: log}).Run(ctx, coinbase.Handler{
+				Message:   func(m coinbase.Message) error { return h.message(m.RecvNs, m.Channel, m.Raw) },
+				Gap:       h.gap,
+				Dropped:   h.dropped,
+				Reconnect: h.reconnect,
+			})
+		},
+	},
+	"kraken": {
+		name:           "kraken",
+		defaultURL:     kraken.DefaultURL,
+		defaultSymbols: kraken.DefaultSymbols,
+		run: func(ctx context.Context, log *slog.Logger, url string, symbols []string, h hooks) error {
+			// Kraken messages carry no sequence number, so there is no gap hook.
+			return kraken.New(kraken.Config{URL: url, Symbols: symbols, Logger: log}).Run(ctx, kraken.Handler{
+				Message:   func(m kraken.Message) error { return h.message(m.RecvNs, m.Channel, m.Raw) },
+				Dropped:   h.dropped,
+				Reconnect: h.reconnect,
+			})
+		},
+	},
+}
+
+func exchangeNames() string {
+	names := make([]string, 0, len(exchanges))
+	for n := range exchanges {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return strings.Join(names, "|")
+}
+
+// options are the resolved command-line settings.
+type options struct {
+	ex      exchange
+	symbols []string
+	url     string
+	dir     string
+}
+
+// resolve applies per-exchange defaults to the raw flag values.
+func resolve(exName, symbols, url, out string) (options, error) {
+	ex, ok := exchanges[exName]
+	if !ok {
+		return options{}, fmt.Errorf("unknown -exchange %q (want %s)", exName, exchangeNames())
+	}
+	o := options{ex: ex, symbols: splitList(symbols), url: url, dir: filepath.Join(out, ex.name)}
+	if len(o.symbols) == 0 {
+		o.symbols = ex.defaultSymbols
+	}
+	if o.url == "" {
+		o.url = ex.defaultURL
+	}
+	return o, nil
+}
 
 func main() {
-	symbols := flag.String("symbols", "BTC-USD,ETH-USD,SOL-USD", "comma-separated product IDs")
-	out := flag.String("out", "data", "output root; files go to <out>/coinbase/YYYY-MM-DD/HH.jsonl.zst")
-	url := flag.String("url", coinbase.DefaultURL, "Coinbase Advanced Trade WebSocket URL")
+	exName := flag.String("exchange", "coinbase", "exchange to record: "+exchangeNames())
+	symbols := flag.String("symbols", "", "comma-separated symbols (default per exchange: coinbase BTC-USD,ETH-USD,SOL-USD; kraken BTC/USD,ETH/USD,SOL/USD)")
+	out := flag.String("out", "data", "output root; files go to <out>/<exchange>/YYYY-MM-DD/HH.jsonl.zst")
+	url := flag.String("url", "", "WebSocket URL (default per exchange)")
 	statsEvery := flag.Duration("stats-interval", 60*time.Second, "interval between stats log lines")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
 
-	if err := run(log, splitList(*symbols), filepath.Join(*out, src), *url, *statsEvery); err != nil {
-		log.Error("recorder failed", "err", err.Error())
+	o, err := resolve(*exName, *symbols, *url, *out)
+	if err == nil {
+		err = run(log, o, *statsEvery)
+	}
+	if err != nil {
+		log.Error("recorder failed", "exchange", *exName, "err", err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(log *slog.Logger, products []string, dir, url string, statsEvery time.Duration) error {
-	if len(products) == 0 {
-		return fmt.Errorf("no symbols given")
-	}
+func run(log *slog.Logger, o options, statsEvery time.Duration) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	w := sink.New(dir)
+	w := sink.New(o.dir)
 	st := newStats()
-	client := coinbase.New(coinbase.Config{URL: url, Products: products, Logger: log})
 
 	statsDone := make(chan struct{})
 	go func() {
@@ -74,11 +154,11 @@ func run(log *slog.Logger, products []string, dir, url string, statsEvery time.D
 		}
 	}()
 
-	log.Info("recorder starting", "products", products, "dir", dir, "url", url)
+	log.Info("recorder starting", "exchange", o.ex.name, "symbols", o.symbols, "dir", o.dir, "url", o.url)
 	var line []byte
-	runErr := client.Run(ctx, coinbase.Handler{
-		Message: func(m coinbase.Message) error {
-			raw := m.Raw
+	runErr := o.ex.run(ctx, log, o.url, o.symbols, hooks{
+		message: func(recvNs int64, channel string, raw []byte) error {
+			n := len(raw)
 			if bytes.IndexByte(raw, '\n') >= 0 {
 				// Newlines can only be insignificant whitespace in valid JSON;
 				// strip them so the record stays on one line.
@@ -89,20 +169,20 @@ func run(log *slog.Logger, products []string, dir, url string, statsEvery time.D
 				raw = buf.Bytes()
 				st.compacted()
 			}
-			line = appendRecord(line[:0], m.RecvNs, raw)
+			line = appendRecord(line[:0], recvNs, o.ex.name, raw)
 			if err := w.Write(line); err != nil {
 				return err
 			}
-			st.message(m.Channel, len(m.Raw))
+			st.message(channel, n)
 			return nil
 		},
-		Gap: func(channel string, r seqcheck.Result) {
+		gap: func(channel string, r seqcheck.Result) {
 			st.gap(channel, r)
 		},
-		Dropped: func(raw []byte, _ error) {
+		dropped: func(raw []byte, _ error) {
 			st.dropped(len(raw))
 		},
-		Reconnect: func(int, time.Duration, error) {
+		reconnect: func(int, time.Duration, error) {
 			st.reconnect()
 		},
 	})
@@ -123,11 +203,14 @@ func run(log *slog.Logger, products []string, dir, url string, statsEvery time.D
 	return closeErr
 }
 
-// appendRecord appends {"recv_ns":N,"src":"coinbase","raw":RAW} to dst.
-func appendRecord(dst []byte, recvNs int64, raw []byte) []byte {
+// appendRecord appends {"recv_ns":N,"src":SRC,"raw":RAW} to dst. src must
+// not need JSON escaping (it is one of the exchange names above).
+func appendRecord(dst []byte, recvNs int64, src string, raw []byte) []byte {
 	dst = append(dst, `{"recv_ns":`...)
 	dst = strconv.AppendInt(dst, recvNs, 10)
-	dst = append(dst, `,"src":"`+src+`","raw":`...)
+	dst = append(dst, `,"src":"`...)
+	dst = append(dst, src...)
+	dst = append(dst, `","raw":`...)
 	dst = append(dst, raw...)
 	return append(dst, '}')
 }
