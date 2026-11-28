@@ -32,43 +32,56 @@ _None yet._
 
 ## Recorder
 
-`cmd/recorder` records raw Coinbase Advanced Trade market data to disk (no Kafka). It subscribes without
-auth to `market_trades`, `level2` and `heartbeats` for the given products, one subscribe message per channel.
+`cmd/recorder` records raw exchange WebSocket market data to disk (no Kafka). It runs **one exchange per
+process** ([ADR 0003](docs/adr/0003-one-recorder-process-per-exchange.md)), chosen with `-exchange`:
+
+| `-exchange` | Endpoint (no auth) | Channels | Default `-symbols` |
+|---|---|---|---|
+| `coinbase` (default) | `wss://advanced-trade-ws.coinbase.com` | `market_trades`, `level2`, `heartbeats` (one subscribe per channel) | `BTC-USD,ETH-USD,SOL-USD` |
+| `kraken` | `wss://ws.kraken.com/v2` | `trade` (with 50-trade snapshot), `book` depth 10 (one subscribe per channel; heartbeats are automatic) | `BTC/USD,ETH/USD,SOL/USD` |
 
 ```sh
-make record                                   # BTC-USD,ETH-USD,SOL-USD into ./data
-make record SYMBOLS=BTC-USD DATA_DIR=/mnt/raw
-go run ./cmd/recorder -symbols BTC-USD,ETH-USD -out data -stats-interval 60s
+make record                                   # coinbase, default symbols, into ./data
+make record EXCHANGE=kraken
+make record EXCHANGE=kraken SYMBOLS=BTC/USD DATA_DIR=/mnt/raw
+go run ./cmd/recorder -exchange kraken -symbols BTC/USD,ETH/USD -out data -stats-interval 60s
 ```
 
-Stop with Ctrl+C: the current file is flushed and closed.
+To record both exchanges, run two processes (two terminals, or `&`). Stop each with Ctrl+C: the current
+file is flushed and closed.
 
-**Output:** `data/coinbase/YYYY-MM-DD/HH.jsonl.zst` (UTC, rotated hourly), one line per WebSocket message:
+**Output:** `data/<exchange>/YYYY-MM-DD/HH.jsonl.zst` (UTC, rotated hourly), one line per WebSocket message:
 
 ```json
-{"recv_ns":<unix nanos>,"src":"coinbase","raw":<original message, unmodified>}
+{"recv_ns":<unix nanos>,"src":"<exchange>","raw":<original message, unmodified>}
 ```
 
 - The open file is named `HH.jsonl.zst.partial` and is renamed when closed cleanly, so a leftover
   `.partial` file means the recorder crashed. A restart within the same hour writes `HH.1.jsonl.zst`
-  instead of overwriting.
-- Read a file with `zstd -dc data/coinbase/2026-11-26/19.jsonl.zst | head -n 5 | jq .`
+  instead of overwriting. The encoder is flushed every 5 s, so a crashed file is readable up to the last flush.
+- Read a file with `zstd -dc data/kraken/2026-11-28/03.jsonl.zst | head -n 5 | jq .`
 - Why this format: [ADR 0002](docs/adr/0002-raw-recorder-storage-format.md).
 
 **Reconnects:** exponential backoff with full jitter (500 ms base, 30 s cap), reset after 60 s of healthy
-connection. A connection with no message for 30 s is treated as dead. Every reconnect is logged.
+connection. A connection with no message for 30 s (Coinbase) or 10 s (Kraken, which sends a heartbeat about
+every second) is treated as dead. Every reconnect is logged. Shared by both exchanges (`internal/wsfeed`).
 
-**Gap detection:** `sequence_num` is tracked per connection (reset on reconnect); skipped numbers are logged
-with expected, got and missing count.
+**Rejected subscriptions (Kraken):** a subscribe ack with `success:false` (for example
+`Currency pair not supported FOO/BAR`) is recorded, logged, and stops the recorder with exit 1 instead of
+reconnecting, since a reconnect cannot fix a bad symbol.
 
-**Logs:** JSON (`log/slog`) on stderr, including a cumulative `stats` line every 60 s with msgs, bytes, dropped non-JSON messages,
-reconnects and gaps per channel.
+**Gap detection:** Coinbase `sequence_num` is tracked per connection (reset on reconnect); skipped numbers
+are logged with expected, got and missing count. Kraken messages have no sequence number; book integrity
+will be checked with Kraken's CRC32 book checksum instead (#17).
+
+**Logs:** JSON (`log/slog`) on stderr, including a cumulative `stats` line every 60 s with msgs, bytes,
+dropped non-JSON messages, reconnects and gaps per channel.
 
 ## Repo layout
 
 ```
 cmd/recorder/      raw WebSocket recorder binary (pre-Kafka data capture)
-internal/          shared packages: sink, backoff, seqcheck, feed/coinbase
+internal/          shared packages: sink, backoff, seqcheck, wsfeed, feed/coinbase, feed/kraken
 ingestor/          per-exchange ingestors -> Kafka
 clickhouse/        DDL, materialized views
 deploy/kind/       kind cluster config

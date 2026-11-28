@@ -1,0 +1,10 @@
+{
+    "method": "subscribe",
+    "params": {
+        "channel": "trade",
+        "symbol": [
+            "MATIC/USD"
+        ],
+        "snapshot": true
+    }
+}

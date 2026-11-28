@@ -2,22 +2,21 @@
 //
 // It connects without authentication, sends one subscribe message per channel
 // for the configured products, and hands every received message to a Handler
-// unmodified. On any connection error it reconnects with exponential backoff
-// and resets sequence tracking.
+// unmodified. Connection handling (dial, read limit, idle timeout, backoff,
+// reconnect) is done by package wsfeed; on every new connection sequence
+// tracking is reset.
 package coinbase
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"time"
 
-	"github.com/coder/websocket"
-
 	"github.com/Vitaliy-Pikalo/market-data-platform/internal/backoff"
 	"github.com/Vitaliy-Pikalo/market-data-platform/internal/seqcheck"
+	"github.com/Vitaliy-Pikalo/market-data-platform/internal/wsfeed"
 )
 
 // Defaults.
@@ -26,13 +25,13 @@ const (
 
 	// DefaultReadLimit is the largest single message accepted. level2
 	// snapshots are far above coder/websocket's 32 KiB default.
-	DefaultReadLimit = 64 << 20 // 64 MiB
+	DefaultReadLimit = wsfeed.DefaultReadLimit
 
 	// DefaultIdleTimeout: with the heartbeats channel subscribed, Coinbase
 	// sends a message every second, so silence this long means a dead connection.
-	DefaultIdleTimeout = 30 * time.Second
+	DefaultIdleTimeout = wsfeed.DefaultIdleTimeout
 
-	DefaultDialTimeout = 15 * time.Second
+	DefaultDialTimeout = wsfeed.DefaultDialTimeout
 )
 
 // DefaultChannels are subscribed to when Config.Channels is empty.
@@ -104,13 +103,6 @@ func New(cfg Config) *Client {
 	return &Client{cfg: cfg, log: cfg.Logger.With("src", "coinbase"), seq: seqcheck.New()}
 }
 
-// handlerError wraps an error returned by Handler.Message so Run can tell it
-// apart from connection errors.
-type handlerError struct{ err error }
-
-func (e handlerError) Error() string { return e.err.Error() }
-func (e handlerError) Unwrap() error { return e.err }
-
 // Run connects and streams until ctx is cancelled (returns nil) or
 // Handler.Message returns an error (returns that error). Connection errors
 // are retried forever.
@@ -118,96 +110,53 @@ func (c *Client) Run(ctx context.Context, h Handler) error {
 	if h.Message == nil {
 		return errors.New("coinbase: Handler.Message is required")
 	}
-	for {
-		uptime, err := c.session(ctx, h)
-		if ctx.Err() != nil {
-			return nil
-		}
-		var he handlerError
-		if errors.As(err, &he) {
-			return he.err
-		}
-		wait := c.cfg.Backoff.Next(uptime)
-		attempt := c.cfg.Backoff.Attempt()
-		c.log.Warn("reconnecting", "attempt", attempt, "wait", wait.String(),
-			"uptime", uptime.Round(time.Millisecond).String(), "err", errString(err))
-		if h.Reconnect != nil {
-			h.Reconnect(attempt, wait, err)
-		}
-		t := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return nil
-		case <-t.C:
-		}
+	subs := make([]wsfeed.Subscription, 0, len(c.cfg.Channels))
+	for _, ch := range c.cfg.Channels {
+		msg, _ := json.Marshal(subscribe{Type: "subscribe", ProductIDs: c.cfg.Products, Channel: ch})
+		subs = append(subs, wsfeed.Subscription{Name: ch, Msg: msg})
 	}
+	return wsfeed.Run(ctx, wsfeed.Config{
+		URL:          c.cfg.URL,
+		ReadLimit:    c.cfg.ReadLimit,
+		IdleTimeout:  c.cfg.IdleTimeout,
+		DialTimeout:  c.cfg.DialTimeout,
+		Backoff:      c.cfg.Backoff,
+		Logger:       c.log,
+		ConnectAttrs: []any{"products", c.cfg.Products, "channels", c.cfg.Channels},
+	}, wsfeed.Session{
+		Subscriptions: subs,
+		OnConnect:     c.seq.Reset,
+		OnMessage: func(recv time.Time, data []byte) error {
+			return c.handle(h, recv, data)
+		},
+		OnReconnect: h.Reconnect,
+	})
 }
 
-// session runs one connection. It returns how long the connection was up
-// (0 if it never got past subscribing) and why it ended.
-func (c *Client) session(ctx context.Context, h Handler) (time.Duration, error) {
-	dialCtx, cancel := context.WithTimeout(ctx, c.cfg.DialTimeout)
-	conn, _, err := websocket.Dial(dialCtx, c.cfg.URL, nil)
-	cancel()
-	if err != nil {
-		return 0, fmt.Errorf("dial: %w", err)
+// handle processes one message. A returned error comes from Handler.Message.
+func (c *Client) handle(h Handler, recv time.Time, data []byte) error {
+	var hdr header
+	if err := json.Unmarshal(data, &hdr); err != nil {
+		// Not JSON: cannot be stored as raw JSON. Log and skip.
+		c.log.Error("invalid json message dropped", "err", err.Error(), "len", len(data))
+		if h.Dropped != nil {
+			h.Dropped(data, err)
+		}
+		return nil
 	}
-	defer conn.CloseNow()
-	conn.SetReadLimit(c.cfg.ReadLimit)
-
-	for _, ch := range c.cfg.Channels {
-		sub, _ := json.Marshal(subscribe{Type: "subscribe", ProductIDs: c.cfg.Products, Channel: ch})
-		wctx, cancel := context.WithTimeout(ctx, c.cfg.DialTimeout)
-		err := conn.Write(wctx, websocket.MessageText, sub)
-		cancel()
-		if err != nil {
-			return 0, fmt.Errorf("subscribe %s: %w", ch, err)
-		}
+	if hdr.Type == "error" {
+		c.log.Error("server error message", "message", hdr.Message)
 	}
-	c.seq.Reset()
-	start := time.Now()
-	c.log.Info("connected", "url", c.cfg.URL, "products", c.cfg.Products, "channels", c.cfg.Channels)
-
-	for {
-		rctx, cancel := context.WithTimeout(ctx, c.cfg.IdleTimeout)
-		_, data, err := conn.Read(rctx)
-		recv := time.Now()
-		cancel()
-		if err != nil {
-			if ctx.Err() != nil {
-				conn.Close(websocket.StatusNormalClosure, "shutdown")
-				return time.Since(start), ctx.Err()
-			}
-			return time.Since(start), fmt.Errorf("read: %w", err)
-		}
-
-		var hdr header
-		if err := json.Unmarshal(data, &hdr); err != nil {
-			// Not JSON: cannot be stored as raw JSON. Log and skip.
-			c.log.Error("invalid json message dropped", "err", err.Error(), "len", len(data))
-			if h.Dropped != nil {
-				h.Dropped(data, err)
-			}
-			continue
-		}
-		if hdr.Type == "error" {
-			c.log.Error("server error message", "message", hdr.Message)
-		}
-		if hdr.Seq != nil {
-			if r := c.seq.Observe(*hdr.Seq); r.Kind != seqcheck.OK {
-				c.log.Warn("sequence "+r.Kind.String(), "channel", hdr.Channel,
-					"expected", r.Expected, "got", r.Got, "missing", r.Missing)
-				if h.Gap != nil {
-					h.Gap(hdr.Channel, r)
-				}
+	if hdr.Seq != nil {
+		if r := c.seq.Observe(*hdr.Seq); r.Kind != seqcheck.OK {
+			c.log.Warn("sequence "+r.Kind.String(), "channel", hdr.Channel,
+				"expected", r.Expected, "got", r.Got, "missing", r.Missing)
+			if h.Gap != nil {
+				h.Gap(hdr.Channel, r)
 			}
 		}
-		if err := h.Message(Message{RecvNs: recv.UnixNano(), Channel: hdr.Channel, Raw: data}); err != nil {
-			conn.Close(websocket.StatusNormalClosure, "shutdown")
-			return time.Since(start), handlerError{err}
-		}
 	}
+	return h.Message(Message{RecvNs: recv.UnixNano(), Channel: hdr.Channel, Raw: data})
 }
 
 type subscribe struct {
@@ -222,11 +171,4 @@ type header struct {
 	Channel string `json:"channel"`
 	Message string `json:"message"`
 	Seq     *int64 `json:"sequence_num"`
-}
-
-func errString(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
 }
