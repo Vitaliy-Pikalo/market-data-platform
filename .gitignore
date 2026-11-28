@@ -7,3 +7,4 @@ bin/
 .idea/
 .vscode/
 .claude/settings.local.json
+docs/animation/out/

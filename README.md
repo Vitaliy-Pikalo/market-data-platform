@@ -4,6 +4,10 @@
 
 Real-time crypto market-data platform on Kubernetes. Public exchange WebSocket feeds (Coinbase, Kraken, Binance.US) are ingested by Go services, written to Kafka (Strimzi), stored in ClickHouse (Altinity operator + Keeper), and served as statistics in Grafana. The focus is operational: replication, failover, backups, restore drills, chaos testing and measured end-to-end latency.
 
+https://github.com/user-attachments/assets/6ff6727e-ff8d-4327-a8a7-6c586b0509a9
+
+*55 s overview. Source: [docs/animation/](docs/animation/), re-render with `python3 render.py render`.*
+
 ## Architecture
 
 _TODO: diagram after Phase 2._
